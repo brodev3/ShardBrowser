@@ -2,7 +2,7 @@
 // library from the ProxyShard CDN, extract into a per-user cache dir,
 // place Widevine inside the engine bundle, remember etags so subsequent
 // runs are zero-network. Mirrors src-tauri/src/runtime.rs in the launcher.
-import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync, chmodSync, copyFileSync, cpSync, lstatSync } from "node:fs";
+import { accessSync, constants, closeSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync, chmodSync, copyFileSync, cpSync, lstatSync, fstatSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { homedir, platform as osPlatform, arch as osArch } from "node:os";
@@ -93,6 +93,7 @@ interface Manifest {
 }
 
 const ACQUIRE_BROWSER_SESSION = Symbol("acquireBrowserSession");
+const ENSURE_RUNTIME_READY = Symbol("ensureRuntimeReady");
 
 interface RuntimeActivity {
   activeBrowsers: number;
@@ -110,11 +111,21 @@ interface StagedReplacement {
 
 class RuntimeRecoveryRequiredError extends AggregateError {}
 
+class RuntimeNotInstalledError extends Error {
+  readonly code = "RUNTIME_NOT_INSTALLED";
+
+  constructor(cause: unknown) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    super(`RUNTIME_NOT_INSTALLED: ${reason}. Prepare the local runtime with runtime.install(); unfinished updates require recovery first.`, { cause });
+  }
+}
+
 export class Runtime {
   readonly root: string;
   readonly spec: HostSpec;
   private readonly progress?: ProgressCb;
   private readonly _profilesRoot?: string;
+  private readonly _autoInstall: boolean;
   /** Set after a successful in-process install() so subsequent launches
    *  skip the R2 HEAD round-trip (~1 s over a clean connection).  Cleared
    *  by `install({force: true})`. */
@@ -138,9 +149,10 @@ export class Runtime {
    *  a profile still carrying the previous list is a mismatch. */
   private _tls?: Record<string, unknown>;
 
-  constructor(opts: { cacheDir?: string; progress?: ProgressCb; profilesDir?: string } = {}) {
+  constructor(opts: { cacheDir?: string; progress?: ProgressCb; profilesDir?: string; autoInstall?: boolean } = {}) {
     this.root = opts.cacheDir ?? defaultCacheDir();
-    mkdirSync(this.root, { recursive: true });
+    this._autoInstall = opts.autoInstall ?? true;
+    if (this._autoInstall) mkdirSync(this.root, { recursive: true });
     this._profilesRoot = opts.profilesDir ? resolve(opts.profilesDir) : undefined;
     this.progress = opts.progress;
     this.spec = hostSpec();
@@ -157,7 +169,7 @@ export class Runtime {
   get binaryPath(): string    { return join(this.root, ...this.spec.binarySubpath); }
   get fingerprintsDir(): string {
     const d = join(this.root, "fingerprints");
-    mkdirSync(d, { recursive: true });
+    if (this._autoInstall) mkdirSync(d, { recursive: true });
     return d;
   }
   /** Per-profile user-data-dir root. Defaults to `<cacheDir>/profiles/`;
@@ -260,11 +272,71 @@ export class Runtime {
       writeFileSync(tmp, JSON.stringify(m, null, 2));
       renameSync(tmp, this.manifestPath);
     } finally {
-      rmSync(tmp, { force: true });
+      // Cleanup must not undo a committed manifest or hide the original failure.
+      try {
+        rmSync(tmp, { force: true });
+      } catch (cleanupError) {
+        const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        console.warn(`[shardx] runtime manifest temporary-file cleanup failed at ${tmp}: ${message}`);
+      }
     }
   }
 
   // ---- install ----
+
+  async [ENSURE_RUNTIME_READY](): Promise<void> {
+    if (this._autoInstall) await this.install();
+    else this.checkLocalInstallation();
+  }
+
+  private checkLocalInstallation(): void {
+    try {
+      this.throwIfRecoveryRequired();
+      if (lstatSync(join(this.root, RUNTIME_UPDATE_RECOVERY_MARKER), { throwIfNoEntry: false })) {
+        throw new Error("the runtime cache contains an unfinished update");
+      }
+      const binary = lstatSync(this.binaryPath);
+      if (!binary.isFile() || !hasExpectedExecutableSignature(this.binaryPath)) {
+        throw new Error("the installed runtime executable is missing or invalid");
+      }
+      if (osPlatform() !== "win32") accessSync(this.binaryPath, constants.X_OK);
+      if (!this.hasUsableWidevine(this.root)) {
+        throw new Error("the installed Widevine bundle is missing or incomplete");
+      }
+      // Do not use fingerprintsDir: implicit readiness checks must not create it.
+      const fingerprints = join(this.root, "fingerprints");
+      if (!lstatSync(fingerprints).isDirectory()) {
+        throw new Error("the fingerprint library is missing or invalid");
+      }
+      const names = readdirSync(fingerprints).filter((name) => name.endsWith(".json"));
+      if (names.length === 0) throw new Error("the fingerprint library contains no JSON profiles");
+      for (const name of names) {
+        const path = join(fingerprints, name);
+        if (!lstatSync(path).isFile() || !isRecord(JSON.parse(readFileSync(path, "utf8")))) {
+          throw new Error(`the fingerprint profile is invalid: ${name}`);
+        }
+      }
+      if (!lstatSync(this.manifestPath).isFile()) {
+        throw new Error("the installed runtime metadata is missing or invalid");
+      }
+      const local: unknown = JSON.parse(readFileSync(this.manifestPath, "utf8"));
+      if (!isRecord(local) || typeof local.installed_chromium_version !== "string"
+          || !/^\d+\.\d+\.\d+\.\d+$/.test(local.installed_chromium_version)) {
+        throw new Error("the local metadata must contain an installed Chromium version");
+      }
+      for (const key of ["installed_engine_build", "installed_grease_brand", "installed_grease_version"]) {
+        if (key in local && (typeof local[key] !== "string" || !(local[key] as string).trim())) {
+          throw new Error(`the local metadata field is invalid: ${key}`);
+        }
+      }
+      if ("installed_tls" in local && !isRecord(local.installed_tls)) {
+        throw new Error("the local TLS metadata is invalid");
+      }
+      this.applyInstalledMetadata(local as Manifest);
+    } catch (error) {
+      throw new RuntimeNotInstalledError(error);
+    }
+  }
 
   async install(opts: { force?: boolean } = {}): Promise<void> {
     this.throwIfRecoveryRequired();
@@ -317,7 +389,8 @@ export class Runtime {
     const needBrowser = force || !this.installed || this.engineOutdated(local, remote);
     const needWidevine = !!this.spec.widevine && (needBrowser || !local.widevine_etag);
     const remoteFp = remote.archives[FINGERPRINTS_ARCHIVE.key];
-    const fingerprintsPath = this.fingerprintsDir;
+    const fingerprintsPath = join(this.root, "fingerprints");
+    mkdirSync(fingerprintsPath, { recursive: true });
     const fpDirHasJson = readdirSync(fingerprintsPath).some((f) => f.endsWith(".json"));
     const needFingerprints = force || !fpDirHasJson
       || (remoteFp !== undefined && local.fingerprints_etag !== remoteFp);
@@ -358,7 +431,10 @@ export class Runtime {
             || !hasExpectedExecutableSignature(stagedBinary)) {
           throw new Error(`runtime archive is missing a valid executable: ${this.spec.binarySubpath.join("/")}`);
         }
-        if (osPlatform() !== "win32") fixUnixExecBits(stagingRoot);
+        if (osPlatform() !== "win32") {
+          fixUnixExecBits(stagingRoot);
+          accessSync(stagedBinary, constants.X_OK);
+        }
         replacements.push({
           stagedPath: join(stagingRoot, this.spec.binarySubpath[0]),
           targetPath: join(this.root, this.spec.binarySubpath[0]),
@@ -442,14 +518,14 @@ export class Runtime {
   private hasUsableInstalledRuntime(): boolean {
     try {
       if (!lstatSync(this.binaryPath).isFile()
-          || !hasExpectedExecutableSignature(this.binaryPath)) return false;
+          || !hasExpectedExecutableSignature(this.binaryPath) || !this.hasUsableWidevine(this.root)) return false;
+      if (osPlatform() !== "win32") accessSync(this.binaryPath, constants.X_OK);
       return readdirSync(this.fingerprintsDir).some((name) => {
         if (!name.endsWith(".json")) return false;
         try {
           const path = join(this.fingerprintsDir, name);
           if (!lstatSync(path).isFile()) return false;
-          JSON.parse(readFileSync(path, "utf8"));
-          return true;
+          return isRecord(JSON.parse(readFileSync(path, "utf8")));
         } catch {
           return false;
         }
@@ -494,7 +570,8 @@ export class Runtime {
     while (this._activationPending) {
       await new Promise<void>((resolve) => this._launchWaiters.push(resolve));
     }
-    this.throwIfRecoveryRequired();
+    if (this._autoInstall) this.throwIfRecoveryRequired();
+    else this.checkLocalInstallation();
     const activity = runtimeActivities.get(this)!;
     activity.activeBrowsers++;
     let released = false;
@@ -662,8 +739,29 @@ export class Runtime {
     mkdirSync(dirname(dst), { recursive: true });
     renameSync(src, dst);
     rmSync(join(root, wrapper), { recursive: true, force: true });
-    if (!lstatSync(dst).isDirectory() || readdirSync(dst).length === 0) {
+    if (!this.hasUsableWidevine(root)) {
       throw new Error("Widevine archive did not produce the expected runtime files");
+    }
+  }
+
+  private hasUsableWidevine(root: string): boolean {
+    if (!this.spec.widevine) return true;
+    try {
+      const dir = join(root, ...this.spec.widevineSubpath);
+      const manifestPath = join(dir, "manifest.json");
+      if (!lstatSync(dir).isDirectory() || !lstatSync(manifestPath).isFile()) return false;
+      const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
+      if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
+          || !("version" in manifest) || typeof manifest.version !== "string"
+          || !/^\d+(?:\.\d+)*$/.test(manifest.version)) return false;
+      const platform = osPlatform();
+      const platformDir = platform === "win32" ? "win_x64" : platform === "linux" ? "linux_x64" : "mac_arm64";
+      const name = platform === "win32" ? "widevinecdm.dll"
+        : platform === "linux" ? "libwidevinecdm.so" : "libwidevinecdm.dylib";
+      const binary = join(dir, "_platform_specific", platformDir, name);
+      return lstatSync(binary).isFile() && hasExpectedNativeBinaryHeader(binary, true);
+    } catch {
+      return false;
     }
   }
 
@@ -698,7 +796,9 @@ export class Runtime {
       if (names.length === 0) throw new Error("fingerprint archive contains no JSON profiles");
       for (const name of names) {
         const src = join(walk, name);
-        JSON.parse(readFileSync(src, "utf8"));
+        if (!lstatSync(src).isFile() || !isRecord(JSON.parse(readFileSync(src, "utf8")))) {
+          throw new Error(`fingerprint archive contains an invalid JSON profile: ${name}`);
+        }
         // Bundled templates overwrite their old copies; user-added JSON files stay intact.
         const target = join(destination, name);
         try {
@@ -716,6 +816,14 @@ export class Runtime {
 
 export function acquireBrowserSessionLease(runtime: Runtime): Promise<() => void> {
   return runtime[ACQUIRE_BROWSER_SESSION]();
+}
+
+export function ensureRuntimeReady(runtime: Runtime): Promise<void> {
+  return runtime[ENSURE_RUNTIME_READY]();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Extract via /usr/bin/unzip — preserves symlinks and permission
@@ -753,6 +861,8 @@ const MACH_O_MAGIC: ReadonlyArray<Buffer> = [
   Buffer.from([0xce, 0xfa, 0xed, 0xfe]),                  // Mach-O 32 LE
   Buffer.from([0xca, 0xfe, 0xba, 0xbe]),                  // Mach-O universal BE
   Buffer.from([0xbe, 0xba, 0xfe, 0xca]),                  // Mach-O universal LE
+  Buffer.from([0xca, 0xfe, 0xba, 0xbf]),                  // Mach-O universal 64 BE
+  Buffer.from([0xbf, 0xba, 0xfe, 0xca]),                  // Mach-O universal 64 LE
 ];
 
 /** ELF + Mach-O magic bytes; first 4 bytes tell us a file is a native
@@ -760,17 +870,140 @@ const MACH_O_MAGIC: ReadonlyArray<Buffer> = [
 const NATIVE_MAGIC: ReadonlyArray<Buffer> = [ELF_MAGIC, ...MACH_O_MAGIC];
 
 function hasExpectedExecutableSignature(path: string): boolean {
+  return hasExpectedNativeBinaryHeader(path, false);
+}
+
+type NativeBinaryReader = (offset: number, length: number) => Buffer;
+
+// Read only headers and check their file ranges. This does not prove that
+// a binary is authentic, loadable, or compatible with all host libraries.
+function hasExpectedNativeBinaryHeader(path: string, library: boolean): boolean {
   const fd = openSync(path, "r");
-  const header = Buffer.alloc(4);
   try {
-    if (readSync(fd, header, 0, header.length, 0) !== header.length) return false;
+    const size = fstatSync(fd).size;
+    const read: NativeBinaryReader = (offset, length) => {
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset + length > size) {
+        throw new Error("native binary header extends past the end of the file");
+      }
+      const bytes = Buffer.alloc(length);
+      if (readSync(fd, bytes, 0, length, offset) !== length) {
+        throw new Error("native binary header is truncated");
+      }
+      return bytes;
+    };
+    if (osPlatform() === "win32") {
+      const dos = read(0, 64);
+      if (dos[0] !== 0x4d || dos[1] !== 0x5a) return false;
+      const offset = dos.readUInt32LE(60);
+      if (offset < 64) return false;
+      const pe = read(offset, 24);
+      const sections = pe.readUInt16LE(6);
+      const optionalSize = pe.readUInt16LE(20);
+      const flags = pe.readUInt16LE(22);
+      if (pe.readUInt32LE(0) !== 0x00004550 || pe.readUInt16LE(4) !== 0x8664
+          || sections === 0 || sections > 96 || optionalSize < 112
+          || !(flags & 0x0002) || !!(flags & 0x2000) !== library) return false;
+      const optional = read(offset + 24, 112);
+      const table = offset + 24 + optionalSize;
+      const end = table + sections * 40;
+      if (optional.readUInt16LE(0) !== 0x20b || end > size
+          || optional.readUInt32LE(60) < end || optional.readUInt32LE(60) > size) return false;
+      let hasData = false;
+      for (let i = 0; i < sections; i++) {
+        const section = read(table + i * 40, 40);
+        const length = section.readUInt32LE(16);
+        const start = section.readUInt32LE(20);
+        if (length && (start < end || start + length > size)) return false;
+        hasData ||= length > 0;
+      }
+      return hasData;
+    }
+    if (osPlatform() === "linux") {
+      const header = read(0, 64);
+      const type = header.readUInt16LE(16);
+      if (!header.subarray(0, 4).equals(ELF_MAGIC) || header[4] !== 2
+          || header[5] !== 1 || header[6] !== 1 || header.readUInt32LE(20) !== 1
+          || header.readUInt16LE(18) !== 62 || header.readUInt16LE(52) !== 64
+          || (!library && header.readBigUInt64LE(24) === 0n)
+          || (library ? type !== 3 : type !== 2 && type !== 3)) return false;
+      const table = header.readBigUInt64LE(32);
+      const count = header.readUInt16LE(56);
+      if (header.readUInt16LE(54) !== 56 || count === 0 || table < 64n
+          || table + BigInt(count) * 56n > BigInt(size)) return false;
+      let hasLoadSegment = false;
+      for (let i = 0; i < count; i++) {
+        const segment = read(Number(table) + i * 56, 56);
+        if (segment.readUInt32LE(0) === 0) continue;
+        const length = segment.readBigUInt64LE(32);
+        if (length && segment.readBigUInt64LE(8) + length > BigInt(size)) return false;
+        if (segment.readUInt32LE(0) === 1) {
+          if (length > segment.readBigUInt64LE(40)) return false;
+          hasLoadSegment ||= length > 0;
+        }
+      }
+      return hasLoadSegment;
+    }
+    if (osPlatform() === "darwin") return hasExpectedMachOHeader(read, size, library);
+    return false;
+  } catch {
+    return false;
   } finally {
     closeSync(fd);
   }
-  if (osPlatform() === "win32") return header[0] === 0x4d && header[1] === 0x5a;
-  if (osPlatform() === "linux") return header.equals(ELF_MAGIC);
-  if (osPlatform() === "darwin") return MACH_O_MAGIC.some((magic) => header.equals(magic));
-  return false;
+}
+
+function hasExpectedMachOHeader(read: NativeBinaryReader, size: number, library: boolean): boolean {
+  const magic = read(0, 8).readUInt32BE(0);
+  const little = magic === 0xcffaedfe || magic === 0xbebafeca || magic === 0xbfbafeca;
+  const uint32 = (bytes: Buffer, offset: number): number =>
+    little ? bytes.readUInt32LE(offset) : bytes.readUInt32BE(offset);
+  const uint64 = (bytes: Buffer, offset: number): bigint =>
+    little ? bytes.readBigUInt64LE(offset) : bytes.readBigUInt64BE(offset);
+  if ([0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca].includes(magic)) {
+    const count = uint32(read(0, 8), 4);
+    const entrySize = magic === 0xcafebabf || magic === 0xbfbafeca ? 32 : 20;
+    const tableEnd = 8 + count * entrySize;
+    if (!count || tableEnd > size) return false;
+    for (let i = 0; i < count; i++) {
+      const entry = read(8 + i * entrySize, entrySize);
+      const offset = entrySize === 32 ? uint64(entry, 8) : BigInt(uint32(entry, 8));
+      const length = entrySize === 32 ? uint64(entry, 16) : BigInt(uint32(entry, 12));
+      if (offset < BigInt(tableEnd) || length < 32n || offset + length > BigInt(size)) return false;
+      if (uint32(entry, 0) === 0x0100000c) {
+        const sliceRead: NativeBinaryReader = (start, bytes) => {
+          if (start + bytes > Number(length)) throw new Error("truncated Mach-O slice");
+          return read(Number(offset) + start, bytes);
+        };
+        // Fat wrappers must contain a thin ARM64 image, not another wrapper.
+        const sliceMagic = sliceRead(0, 4).readUInt32BE(0);
+        if (sliceMagic !== 0xfeedfacf && sliceMagic !== 0xcffaedfe) return false;
+        return hasExpectedMachOHeader(sliceRead, Number(length), library);
+      }
+    }
+    return false;
+  }
+  if (magic !== 0xfeedfacf && magic !== 0xcffaedfe) return false;
+  const header = read(0, 32);
+  const count = uint32(header, 16);
+  const commandsEnd = 32 + uint32(header, 20);
+  if (uint32(header, 4) !== 0x0100000c || uint32(header, 12) !== (library ? 6 : 2)
+      || !count || count > (commandsEnd - 32) / 8 || commandsEnd > size) return false;
+  let offset = 32;
+  let hasSegment = false;
+  for (let i = 0; i < count; i++) {
+    const command = read(offset, 8);
+    const length = uint32(command, 4);
+    if (length < 8 || offset + length > commandsEnd) return false;
+    if (uint32(command, 0) === 0x19) {
+      if (length < 72) return false;
+      const segment = read(offset, 72);
+      const fileLength = uint64(segment, 48);
+      if (uint64(segment, 40) + fileLength > BigInt(size)) return false;
+      hasSegment ||= fileLength > 0n;
+    }
+    offset += length;
+  }
+  return offset === commandsEnd && hasSegment;
 }
 
 /** Walk `root` and add +x to every file whose first 4 bytes match a known
@@ -784,15 +1017,21 @@ function fixUnixExecBits(root: string): void {
       if (ent.isSymbolicLink()) continue;
       if (ent.isDirectory()) { walk(p); continue; }
       if (!ent.isFile()) continue;
+      let native = false;
       try {
         const fd = openSync(p, "r");
         const buf = Buffer.alloc(4);
-        readSync(fd, buf, 0, 4, 0);
-        closeSync(fd);
-        if (NATIVE_MAGIC.some((m) => buf.equals(m))) {
-          chmodSync(p, lstatSync(p).mode | 0o111);
+        try {
+          readSync(fd, buf, 0, 4, 0);
+        } finally {
+          closeSync(fd);
         }
-      } catch { /* skip unreadable / racing files */ }
+        native = NATIVE_MAGIC.some((m) => buf.equals(m));
+      } catch {
+        continue;
+      }
+      // Permission failures must abort preparation before activation.
+      if (native) chmodSync(p, lstatSync(p).mode | 0o111);
     }
   };
   walk(root);

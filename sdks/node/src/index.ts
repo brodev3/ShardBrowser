@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { Runtime, type ProgressCb } from "./runtime.js";
+import { ensureRuntimeReady, Runtime, type ProgressCb } from "./runtime.js";
 import { FingerprintLibrary, Profile } from "./profile.js";
 import { Browser, type LaunchOptions, type BrowserSession } from "./browser.js";
 import { randomizeHardware, randomizePlatformVersion } from "./randomize.js";
@@ -16,6 +16,9 @@ export interface ShardXOptions {
   /** Where the engine, Widevine, and bundled fingerprint library live
    *  (defaults to the per-OS app-data dir). */
   cacheDir?: string;
+  /** Automatically install/update the runtime on ordinary SDK operations.
+   *  Defaults to true. False requires a complete local installation. */
+  autoInstall?: boolean;
   progress?: ProgressCb;
   /** Per-profile user-data-dir root (cookies, IndexedDB, cache).
    *  Defaults to `./shardx-profiles/` next to the running script. */
@@ -46,13 +49,13 @@ export class ShardX {
   }
 
   /** All bundled fingerprint ids, optionally filtered by `navigator.platform`.
-   *  Auto-installs the fingerprint library on first call. */
+   *  Auto-installs on first call unless autoInstall is false. */
   async listProfiles(opts: { platform?: string } = {}): Promise<string[]> {
-    await this.runtime.install();
+    await ensureRuntimeReady(this.runtime);
     return opts.platform ? Array.from(this.library.filter({ platform: opts.platform })) : this.library.ids();
   }
 
-  /** Pick a random profile from the library.  Auto-installs on first call. */
+  /** Pick a random profile from the library. Respects autoInstall. */
   async randomProfile(opts: { platform?: string } = {}): Promise<Profile> {
     const ids = await this.listProfiles(opts);
     if (ids.length === 0) {
@@ -83,7 +86,7 @@ export class ShardX {
     template?: string,
     opts: { platform?: string; refreshRate?: number } = {},
   ): Promise<Profile> {
-    await this.runtime.install();
+    await ensureRuntimeReady(this.runtime);
     const src = template == null
       ? await this.randomProfile({ platform: opts.platform })
       : this.library.load(template);
@@ -162,7 +165,7 @@ export class ShardX {
         );
       }
     }
-    await this.runtime.install();
+    await ensureRuntimeReady(this.runtime);
     if (opts.randomize) {
       randomizeHardware(profile.config, profile.id);
       randomizePlatformVersion(profile.config);

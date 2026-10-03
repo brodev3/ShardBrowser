@@ -16,7 +16,7 @@ import { hasAutoFields, resolveAutoFields } from "./autoResolve.js";
 import { geoCheckVia, type GeoInfo } from "./geo.js";
 import { Profile, userDataDir, applyEngineVersion } from "./profile.js";
 import { parseProxy, probeUdp, proxyToArg, type ParsedProxy } from "./proxy.js";
-import { acquireBrowserSessionLease, type Runtime } from "./runtime.js";
+import { acquireBrowserSessionLease, ensureRuntimeReady, type Runtime } from "./runtime.js";
 import { applyScreenStrategy, defaultScreenModeFor, type ScreenStrategy } from "./screen.js";
 
 export function awaitBrowserSpawn(child: ChildProcess, release: () => void): Promise<void> {
@@ -139,10 +139,9 @@ export class Browser {
   constructor(private readonly runtime: Runtime) {}
 
   async launch(profile: Profile, opts: LaunchOptions = {}): Promise<BrowserSession> {
-    // Auto-install on first use (high-level ShardX.launch already does
-    // this; the call is here too so low-level Browser.launch users
-    // don't have to remember).
-    await this.runtime.install();
+    // Enforce the same install policy before any geo/proxy probes or spawning,
+    // including callers that use Browser directly.
+    await ensureRuntimeReady(this.runtime);
 
     const parsed: ParsedProxy | null = opts.proxy ? parseProxy(opts.proxy) : null;
 

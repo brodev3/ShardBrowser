@@ -354,9 +354,43 @@ const sdk = new ShardX({ cacheDir: "/data/shardx" });
 
 ## Update the runtime
 
-The SDK auto-checks remote etags on the first `session`/`launch`/`listProfiles`
-call of each process and re-downloads anything that changed.  To force a
-re-download mid-process:
+`autoInstall` defaults to `true`: the SDK checks the remote manifest on the
+first ordinary operation and downloads or updates the engine, Widevine and
+fingerprint library when needed. To disable these implicit installer requests:
+
+```ts
+const sdk = new ShardX({ cacheDir: "/data/shardx", autoInstall: false });
+const ids = await sdk.listProfiles(); // reads the prepared local installation
+```
+
+With `autoInstall: false`, `listProfiles()`, `randomProfile()`,
+`createProfile()`, `launch()`, `session()` and `new Browser(sdk.runtime).launch()`
+require a complete local installation. The read-only check rejects an unfinished
+update marker, a missing/invalid executable or Widevine bundle, an empty or
+invalid JSON fingerprint library, or missing/invalid cached metadata. The local
+`manifest.json` must contain `installed_chromium_version` as a four-part numeric
+version; optional saved GREASE/TLS metadata is validated and loaded into memory.
+Every library `.json` must be a regular file containing a JSON object.
+Native headers and their declared file ranges are checked without running the
+binary. Widevine must have a JSON manifest with a numeric version and the native
+CDM library under `_platform_specific/<platform>`. These structural checks do
+not guarantee successful execution or verify the origin of the files.
+Older caches without sufficient metadata must be explicitly installed first.
+Failure raises an error with `code === "RUNTIME_NOT_INSTALLED"` before geo checks,
+UDP proxy probes or browser spawning, without repairing or creating runtime files.
+
+This is **not an offline mode**: geo checks, UDP proxy probes and the local
+CDP connection in `session()` keep their existing behavior after local readiness
+passes. Local readiness is not proof of archive authenticity.
+
+Explicit installation is still allowed regardless of `autoInstall` and may
+access the network:
+
+```ts
+await sdk.runtime.install();
+```
+
+To force a re-download mid-process:
 
 ```ts
 await sdk.runtime.install({ force: true });
