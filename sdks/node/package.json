@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test test/adm-zip.security.test.mjs test/runtime.update.test.mjs test/runtime.auto-install.test.mjs",
+    "test": "npm run build && node --test test/adm-zip.security.test.mjs test/runtime.update.test.mjs test/runtime.auto-install.test.mjs test/package.build.test.mjs",
+    "prepack": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "engines": {

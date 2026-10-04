@@ -20,6 +20,44 @@ npm install @proxyshard/shardx
 
 Supported hosts: **macOS arm64**, **Windows x64**, **Linux x64**. Node ≥ 18.
 
+### Install this fork from Git
+
+With pnpm 11, select this SDK subdirectory and pin a full commit hash, not a
+moving branch:
+
+```json
+{
+  "dependencies": {
+    "@proxyshard/shardx": "git+https://github.com/brodev3/ShardBrowser.git#<full-commit-sha>&path:sdks/node"
+  }
+}
+```
+
+The checkout does not contain `dist`. The SDK's `prepack` script explicitly
+builds it during pnpm's Git dependency preparation. Approve only the exact
+Git dependency identity reported by pnpm in the consumer's `allowBuilds`;
+do not enable scripts for all dependencies. With `--ignore-scripts`, pnpm skips
+this build, so a source-only Git installation is not usable.
+
+The SDK's project `.npmrc` disables lifecycle scripts for the nested `npm install`.
+Explicit `npm run prepack` still runs the TypeScript build. This setting is not
+a sandbox: CLI/environment overrides can change it, and installing dependencies
+still uses the package registry. This build does not invoke SDK operations or
+install/launch a browser. Construct the SDK with `autoInstall: false` to separately
+disable implicit runtime installation when using it.
+
+When packing or publishing this SDK yourself, build explicitly first:
+`npm run build` followed by `npm pack` or `npm publish`. The project `.npmrc`
+also disables automatic npm packaging/publishing lifecycle hooks.
+
+The regular `npm test` includes offline npm build-policy fixtures. To also test
+pnpm 11 Git preparation, set `SHARDX_TEST_PNPM_CLI` to an existing pnpm JavaScript
+CLI entry point before running `npm test`. This optional test uses a temporary
+local Git repository, local-only dependencies and an isolated store; it checks
+denied/approved builds, SDK subdirectory selection and the installed module's
+import without network access or browser operations. It does not prove installation
+from GitHub or the real SDK's complete dependency tree.
+
 ### Linux system dependencies
 
 The bundled Chromium engine needs `unzip` + the standard set of shared
