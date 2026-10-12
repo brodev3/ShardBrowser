@@ -1,3 +1,13 @@
+## About this fork
+
+This fork of [ProxyShard/ShardBrowser](https://github.com/ProxyShard/ShardBrowser) documents my work on runtime reliability and installation control in its Node.js/TypeScript SDK (`sdks/node`), not Chromium patches or a new fingerprint engine. `main` preserves the upstream implementation; the SDK changes are available in the branches below. Original authorship and the [MIT license](LICENSE) are retained. PR statuses were checked on 2026-10-12.
+
+- **ZIP extraction:** [code](https://github.com/brodev3/ShardBrowser/tree/fix/node-sdk-adm-zip-0.6.1/sdks/node), [PR #89](https://github.com/ProxyShard/ShardBrowser/pull/89) (open). Updates `adm-zip` to `^0.6.1` and adds bounded regression tests for oversized ZIP entries and extraction through existing symbolic links.
+- **Runtime update recovery:** [code](https://github.com/brodev3/ShardBrowser/tree/fix/node-sdk-runtime-update-rollback/sdks/node), [PR #98](https://github.com/ProxyShard/ShardBrowser/pull/98) (open). Stages replacement files, validates archives/components, rolls back failed activation, waits for tracked browsers within one SDK instance, and persists unfinished-update markers, with failure tests. This does not verify archive authenticity.
+- **Installation policy:** [code](https://github.com/brodev3/ShardBrowser/tree/fix/node-sdk-auto-install/sdks/node) (fork-only). Adds `autoInstall: false` with read-only local checks, retaining explicit installation and other network behavior. Also builds the SDK when packaging a pinned Git dependency.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/shardx-logo-dark.png">
